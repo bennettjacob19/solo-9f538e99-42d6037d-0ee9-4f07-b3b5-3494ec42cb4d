@@ -6,7 +6,9 @@
   GET  /tickets/{tid}                 进度、阻塞原因、存储水位
   POST /tickets/{tid}/advance         推进清理（自动核对未明删除后继续）
   GET  /tickets/{tid}/retained        留存副本清单
-  GET  /tickets/{tid}/retained/{pvc}  凭单号读回所选数据
+  GET  /tickets/{tid}/retained/{pvc}  凭单号读回所选数据（缺件时按保护自动重建）
+  POST /tickets/{tid}/protection/enable  为已完成工单的等长留存卷启用缺件保护
+  GET  /tickets/{tid}/protection      查看缺件保护状态、各卷存活/缺失与资源水位
 
 模拟端管理面：
   POST /sim/seed    造一个命名空间和若干已停写绑定卷
@@ -26,6 +28,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 
 from .engine import Engine
 from .models import FaultRequest, SeedRequest, TicketRequest
+from .protection import ReadBudgetExceeded
 from .simcluster import ConflictError, NotFoundError
 
 engine: Engine
@@ -43,9 +46,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="K8s 命名空间清退留存演练",
-    version="1.0.0",
+    version="1.1.0",
     description="清退测试命名空间时保留指定 PVC 数据：先独立读回校验留存副本，再按 PV 回收策略删除源卷；"
-                "支持删除丢包注入、SQLite 进度持久化、重启核对续办、按开单 UID 清理。",
+                "支持删除丢包注入、SQLite 进度持久化、重启核对续办、按开单 UID 清理。"
+                "DONE 工单可启用缺件保护（XOR 奇偶卷）：移走任一留存卷后重启仍可凭原链接重建取回，"
+                "整卷通过开单 SHA-256 才发送正文；同单缺两件或校验失败时报错。",
     lifespan=lifespan,
 )
 
@@ -55,7 +60,7 @@ def _guard(fn, *args, **kwargs):
         return fn(*args, **kwargs)
     except NotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    except ConflictError as e:
+    except (ConflictError, ReadBudgetExceeded) as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -95,10 +100,22 @@ def list_retained(tid: str):
 
 
 @app.get("/tickets/{tid}/retained/{pvc_name}", tags=["tickets"],
-         summary="凭单号读回所选 PVC 的数据")
+         summary="凭单号读回所选 PVC 的数据（留存缺失时用保护卷自动重建）")
 def download_retained(tid: str, pvc_name: str):
     path = _guard(engine.retained_file, tid, pvc_name)
     return FileResponse(path, filename=f"{tid}-{pvc_name}.bin", media_type="application/octet-stream")
+
+
+@app.post("/tickets/{tid}/protection/enable", tags=["protection"],
+          summary="启用缺件保护：为 DONE 工单的等长留存卷生成 XOR 奇偶保护卷")
+def enable_protection(tid: str):
+    return _guard(engine.enable_protection, tid)
+
+
+@app.get("/tickets/{tid}/protection", tags=["protection"],
+         summary="查看缺件保护状态（已保护/中断、各卷存活与缺失、资源水位）")
+def get_protection(tid: str):
+    return _guard(engine.protection_status, tid)
 
 
 # ---------------- 模拟端管理面 ----------------

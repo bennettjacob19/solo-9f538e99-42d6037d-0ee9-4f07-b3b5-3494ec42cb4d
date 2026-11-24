@@ -42,7 +42,32 @@ CREATE TABLE IF NOT EXISTS ops (
   last_error      TEXT,
   updated_at      TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS protection (
+  ticket_id      TEXT PRIMARY KEY,
+  state          TEXT NOT NULL,              -- interrupted/enabling/protected
+  volume_size    INTEGER NOT NULL,           -- 等长留存卷大小 V
+  volume_count   INTEGER NOT NULL,           -- 参与保护的留存卷数 N（<=4）
+  parity_name    TEXT NOT NULL,              -- 保护卷文件名（相对 ticket 目录）
+  parity_sha256  TEXT NOT NULL,              -- 保护卷开单校验值（生成时即定）
+  enabled_at     TEXT,
+  updated_at     TEXT NOT NULL
+);
 """
+
+# 旧库（无 protection 表）平滑升级
+MIGRATIONS = (
+    ("protection",
+     """CREATE TABLE IF NOT EXISTS protection (
+          ticket_id      TEXT PRIMARY KEY,
+          state          TEXT NOT NULL,
+          volume_size    INTEGER NOT NULL,
+          volume_count   INTEGER NOT NULL,
+          parity_name    TEXT NOT NULL,
+          parity_sha256  TEXT NOT NULL,
+          enabled_at     TEXT,
+          updated_at     TEXT NOT NULL
+        )"""),
+)
 
 
 class DB:
@@ -54,6 +79,11 @@ class DB:
         conn = self._conn()
         try:
             conn.executescript(SCHEMA)
+            existing = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            for table, ddl in MIGRATIONS:
+                if table not in existing:
+                    conn.execute(ddl)
             conn.commit()
         finally:
             conn.close()

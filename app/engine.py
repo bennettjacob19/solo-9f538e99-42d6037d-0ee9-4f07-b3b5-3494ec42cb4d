@@ -19,12 +19,16 @@ import threading
 import uuid
 from pathlib import Path
 
+from . import protection as prot
 from .db import DB
 from .simcluster import (ConflictError, DroppedResponseError, NotFoundError,
                          SimCluster)
 from .util import now_iso, sha256_file, write_json
 
 MAX_STEPS_PER_ADVANCE = 1000
+MAX_PROTECTED_VOLUMES = 4          # 一次缺件下载最多读 4 个卷大小
+REBUILD_READ_BUDGET_VOLUMES = 4    # 预算：4V（含暂存回读）
+PROTECTED_DISK_BUDGET_VOLUMES = 3  # 保护正文 + 临时正文 <= 3V
 
 
 class Engine:
@@ -36,6 +40,11 @@ class Engine:
         self.retained_root.mkdir(parents=True, exist_ok=True)
         self.db = DB(self.data_dir / "app.db")
         self._lock = threading.RLock()
+        # 同一工单的“启用保护 / 缺件下载”互斥（非阻塞抢占，抢不到即 409）；
+        # 现存卷的正常下载不走该锁，互不影响。
+        self._job_locks: dict[str, threading.Lock] = {}
+        self._job_locks_guard = threading.Lock()
+        self._recover_protection()
 
     # ---------------- 开单 ----------------
     def create_ticket(self, namespace: str, retain_pvcs: list[str], note: str | None = None) -> dict:
@@ -100,16 +109,20 @@ class Engine:
         return out
 
     def retained_file(self, tid: str, pvc_name: str) -> Path:
-        self._ticket(tid)
-        row = self.db.one(
-            "SELECT * FROM pvcs WHERE ticket_id=? AND name=? AND selected=1", (tid, pvc_name))
-        if not row:
-            raise NotFoundError(f"工单 {tid} 中不存在选中 PVC {pvc_name!r}")
-        path = self.retained_root / tid / pvc_name / "data.bin"
-        meta = self.retained_root / tid / pvc_name / "meta.json"
-        if not path.exists() or not meta.exists():
-            raise NotFoundError(f"工单 {tid} 的 PVC {pvc_name!r} 尚未完成留存")
-        return path
+        with self._lock:
+            self._ticket(tid)
+            row = self.db.one(
+                "SELECT * FROM pvcs WHERE ticket_id=? AND name=? AND selected=1", (tid, pvc_name))
+            if not row:
+                raise NotFoundError(f"工单 {tid} 中不存在选中 PVC {pvc_name!r}")
+            path = self.retained_root / tid / pvc_name / "data.bin"
+            meta = self.retained_root / tid / pvc_name / "meta.json"
+            if path.exists():
+                return path  # 现存卷照常下载：不占任务锁，与启用/重建互不阻塞
+            if not meta.exists() and not self._protection_row(tid):
+                raise NotFoundError(f"工单 {tid} 的 PVC {pvc_name!r} 尚未完成留存")
+        # 留存正文缺失 -> 走缺件保护重建（同单串行，抢锁失败即 409）
+        return self._rebuild_missing(tid, row)
 
     def status(self, tid: str) -> dict:
         t = self._ticket(tid)
@@ -355,6 +368,283 @@ class Engine:
                         resolved += 1
         return resolved
 
+    # ---------------- 缺件保护（XOR 奇偶卷） ----------------
+    def _job_lock(self, tid: str) -> threading.Lock:
+        with self._job_locks_guard:
+            lk = self._job_locks.get(tid)
+            if lk is None:
+                lk = threading.Lock()
+                self._job_locks[tid] = lk
+            return lk
+
+    def _protection_dir(self, tid: str) -> Path:
+        return self.retained_root / tid / ".protection"
+
+    def _parity_path(self, tid: str) -> Path:
+        return self._protection_dir(tid) / "parity.bin"
+
+    def _parity_tmp(self, tid: str) -> Path:
+        return self._protection_dir(tid) / "parity.tmp"
+
+    def _rebuild_tmp(self, pvc_dir: Path) -> Path:
+        return pvc_dir / ".rebuild.tmp"
+
+    def _protection_row(self, tid: str) -> dict | None:
+        return self.db.one("SELECT * FROM protection WHERE ticket_id=?", (tid,))
+
+    def _selected_pvc_rows(self, tid: str) -> list[dict]:
+        return self.db.query(
+            "SELECT * FROM pvcs WHERE ticket_id=? AND selected=1 ORDER BY name", (tid,))
+
+    def _protection_body_bytes(self, tid: str) -> int:
+        """保护正文 + 临时正文的落盘字节。
+
+        含保护目录内全部正文（parity.bin/parity.tmp）以及各卷目录下的重建临时正文；
+        正式留存卷 data.bin 不计入本预算（其水位由工单 storage 口径统计）。
+        """
+        total = 0
+        pdir = self._protection_dir(tid)
+        if pdir.exists():
+            total += sum(f.stat().st_size for f in pdir.iterdir() if f.is_file())
+        tdir = self.retained_root / tid
+        if tdir.exists():
+            for d in tdir.iterdir():
+                if d.is_dir():
+                    for f in d.iterdir():
+                        if f.is_file() and f.name.startswith(".") and f.name.endswith(".tmp"):
+                            total += f.stat().st_size
+        return total
+
+    def _assert_protection_disk_budget(self, tid: str, volume_size: int) -> None:
+        used = self._protection_body_bytes(tid)
+        cap = PROTECTED_DISK_BUDGET_VOLUMES * volume_size
+        if used > cap:
+            raise ConflictError(
+                f"保护存储上限保护：保护正文+临时正文 {used} 超过 {cap} 字节"
+                f"（3 个卷大小），本次操作中止")
+
+    def _recover_protection(self) -> None:
+        """启动恢复：清掉中断遗留的临时正文（不累积），把 enabling 置为 interrupted。"""
+        with self._lock:
+            for row in self.db.query("SELECT * FROM protection"):
+                tid = row["ticket_id"]
+                for tmp in (self._parity_tmp(tid),):
+                    if tmp.exists():
+                        tmp.unlink()
+                tdir = self.retained_root / tid
+                if tdir.exists():
+                    for d in tdir.iterdir():
+                        rt = self._rebuild_tmp(d)
+                        if d.is_dir() and rt.exists():
+                            rt.unlink()
+                if row["state"] == "enabling":
+                    self.db.execute(
+                        "UPDATE protection SET state='interrupted', updated_at=? WHERE ticket_id=?",
+                        (now_iso(), tid))
+
+    def enable_protection(self, tid: str) -> dict:
+        """为已完成工单的等长留存卷启用缺件保护（可重试，临时正文不累积）。"""
+        job = self._job_lock(tid)
+        if not job.acquire(blocking=False):
+            raise ConflictError(
+                f"工单 {tid} 已有启用保护或缺件下载在处理中；同一工单同时只处理一次")
+        try:
+            with self._lock:
+                t = self._ticket(tid)
+                if t["state"] != "DONE":
+                    raise ConflictError(f"工单 {tid} 尚未 DONE，不能启用缺件保护")
+                rows = self._selected_pvc_rows(tid)
+                if not (2 <= len(rows) <= MAX_PROTECTED_VOLUMES):
+                    raise ValueError(
+                        f"缺件保护要求 2~{MAX_PROTECTED_VOLUMES} 个留存卷，当前 {len(rows)} 个")
+                data_paths = [self.retained_root / tid / r["name"] / "data.bin"
+                              for r in rows]
+                missing = [r["name"] for r, p in zip(rows, data_paths) if not p.exists()]
+                if missing:
+                    raise NotFoundError(
+                        f"留存卷缺失，无法启用保护（请先通过缺件下载取回）: {missing}")
+                sizes = {p.stat().st_size for p in data_paths}
+                if len(sizes) != 1:
+                    raise ValueError("留存卷大小不一致：缺件保护仅支持等长卷")
+                v = sizes.pop()
+                existing = self._protection_row(tid)
+                if existing and existing["state"] == "protected" \
+                        and self._parity_path(tid).exists():
+                    return self.protection_status(tid)  # 已保护：幂等返回
+                # 重试纪律：先清掉任何中断遗留的临时正文，保证不累积
+                if self._parity_tmp(tid).exists():
+                    self._parity_tmp(tid).unlink()
+                self.db.execute(
+                    "INSERT INTO protection(ticket_id,state,volume_size,volume_count,"
+                    "parity_name,parity_sha256,enabled_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,NULL,?) ON CONFLICT(ticket_id) DO UPDATE SET "
+                    "state=excluded.state, updated_at=excluded.updated_at",
+                    (tid, "enabling", v, len(rows), "parity.bin", "", now_iso()))
+                pdir = self._protection_dir(tid)
+                pdir.mkdir(parents=True, exist_ok=True)
+                tmp = self._parity_tmp(tid)
+                final = self._parity_path(tid)
+                # 启用读取预算：N 个留存卷生成 + 1 个保护卷暂存回读 = (N+1)V <= 5V
+                meter = prot.ReadMeter((len(rows) + 1) * v)
+                try:
+                    parity_sha = prot.xor_streams(data_paths, tmp, meter, v)
+                    self._assert_protection_disk_budget(tid, v)
+                    # 保护数据完整落盘并读回核对通过后才改名、才显示已保护
+                    prot.readback_verify(tmp, v, parity_sha, meter)
+                    prot.durable_write_finish(tmp, final)
+                    self.db.execute(
+                        "UPDATE protection SET state='protected', parity_sha256=?, "
+                        "enabled_at=?, updated_at=? WHERE ticket_id=?",
+                        (parity_sha, now_iso(), now_iso(), tid))
+                except Exception:
+                    if tmp.exists():
+                        tmp.unlink()
+                    self.db.execute(
+                        "UPDATE protection SET state='interrupted', updated_at=? WHERE ticket_id=?",
+                        (now_iso(), tid))
+                    raise
+                status = self.protection_status(tid)
+                status["enable"] = {
+                    "read_bytes": meter.read_bytes,
+                    "read_budget_bytes": meter.budget,
+                    "parity_sha256": parity_sha,
+                }
+                return status
+        finally:
+            job.release()
+
+    def _rebuild_missing(self, tid: str, row: dict) -> Path:
+        """用保护卷 + 其余存活卷重建缺失的单个留存卷。"""
+        job = self._job_lock(tid)
+        if not job.acquire(blocking=False):
+            raise ConflictError(
+                f"工单 {tid} 已有启用保护或缺件下载在处理中；同一工单同时只处理一次")
+        try:
+            with self._lock:
+                t = self._ticket(tid)
+                if t["state"] != "DONE":
+                    raise ConflictError(f"工单 {tid} 尚未 DONE，不提供缺件下载")
+                p = self._protection_row(tid)
+                if not p or p["state"] != "protected":
+                    raise NotFoundError(
+                        f"工单 {tid} 未启用缺件保护，无法取回缺失卷 {row['name']!r}")
+                v = p["volume_size"]
+                all_rows = self._selected_pvc_rows(tid)
+                present, absent = [], []
+                for r in all_rows:
+                    dp = self.retained_root / tid / r["name"] / "data.bin"
+                    (present if dp.exists() else absent).append((r, dp))
+                target = self.retained_root / tid / row["name"] / "data.bin"
+                if target.exists():
+                    return target  # 等待锁期间已被别的请求重建好
+                # 同单缺两件（或更多）：XOR 单奇偶卷数学上不可恢复
+                if len(absent) >= 2:
+                    raise ConflictError(
+                        f"同单缺失 {len(absent)} 个留存卷 {[r['name'] for r, _ in absent]}，"
+                        "缺件保护仅能重建单件，缺件下载失败")
+                parity = self._parity_path(tid)
+                if not parity.exists():
+                    raise ConflictError(
+                        "保护卷本身缺失，无法重建（保护数据不完整），缺件下载失败")
+                inputs = [parity] + [dp for _, dp in present]
+                if len(inputs) != len(all_rows):
+                    raise ConflictError(
+                        f"重建输入不足：需要 {len(all_rows)} 个等长卷，"
+                        f"现存 {len(present)} 个 + 保护卷 1 个，缺件下载失败")
+                bad_size = [str(dp) for _, dp in present if dp.stat().st_size != v]
+                if bad_size or parity.stat().st_size != v:
+                    raise ConflictError(
+                        "现存留存卷/保护卷长度与开单快照不符，拒绝在不可信输入上重建")
+                pvc_dir = target.parent
+                pvc_dir.mkdir(parents=True, exist_ok=True)
+                tmp = self._rebuild_tmp(pvc_dir)
+                if tmp.exists():  # 上次中断的暂存正文：清掉重来，不累积
+                    tmp.unlink()
+                # 一次缺件下载最多读取 4V（N 个输入卷；N=4 时已读满，无独立回读预算）
+                meter = prot.ReadMeter(REBUILD_READ_BUDGET_VOLUMES * v)
+                try:
+                    # 异或输出流上内联计算整卷 SHA-256：每个重建字节发送前均经哈希，
+                    # 无需暂存回读即完成“整卷按开单 SHA-256 校验”
+                    rebuilt_sha = prot.xor_streams(inputs, tmp, meter, v)
+                    self._assert_protection_disk_budget(tid, v)
+                    with open(tmp, "rb") as f:
+                        os.fsync(f.fileno())
+                    if tmp.stat().st_size != v or rebuilt_sha != row["sha256"]:
+                        raise prot.ProtectionIntegrityError(
+                            f"重建卷长度或 SHA-256 与开单快照不符："
+                            f"期望 sha={row['sha256']} size={v}，"
+                            f"实得 sha={rebuilt_sha} size={tmp.stat().st_size}")
+                    prot.durable_write_finish(tmp, target)
+                    # meta.json 若随正文一起被移走，按开单快照补写（数据以 DB 快照为准）
+                    meta = pvc_dir / "meta.json"
+                    if not meta.exists():
+                        write_json(meta, {
+                            "ticket_id": tid, "pvc_name": row["name"], "pvc_uid": row["uid"],
+                            "source_namespace": t["namespace_name"],
+                            "source_namespace_uid": t["namespace_uid"],
+                            "pv_name": row["pv_name"], "size_bytes": row["size_bytes"],
+                            "sha256": row["sha256"], "retained_at": now_iso(),
+                            "rebuilt_from_protection": True,
+                        })
+                except prot.ProtectionIntegrityError as e:
+                    if tmp.exists():
+                        tmp.unlink()
+                    raise ConflictError(
+                        f"重建卷 {row['name']!r} 未通过开单 SHA-256 校验，缺件下载失败：{e}")
+                except prot.ReadBudgetExceeded:
+                    if tmp.exists():
+                        tmp.unlink()
+                    raise
+                self._last_rebuild_io = {
+                    "ticket_id": tid, "pvc_name": row["name"],
+                    "read_bytes": meter.read_bytes, "read_budget_bytes": meter.budget,
+                    "chunk_size": prot.CHUNK_SIZE,
+                }
+                return target
+        finally:
+            job.release()
+
+    def protection_status(self, tid: str) -> dict:
+        """缺件保护状态（/docs 可查）：保护态、各卷存活/缺失、落盘与预算水位。"""
+        with self._lock:
+            t = self._ticket(tid)
+            rows = self._selected_pvc_rows(tid)
+            p = self._protection_row(tid)
+            volumes = []
+            for r in rows:
+                dp = self.retained_root / tid / r["name"] / "data.bin"
+                volumes.append({
+                    "pvc_name": r["name"], "size_bytes": r["size_bytes"],
+                    "ticket_sha256": r["sha256"],
+                    "present": dp.exists(),
+                    "on_disk_bytes": dp.stat().st_size if dp.exists() else 0,
+                })
+            v = p["volume_size"] if p else (rows[0]["size_bytes"] if rows else 0)
+            missing = [x["pvc_name"] for x in volumes if not x["present"]]
+            parity_path = self._parity_path(tid)
+            out = {
+                "ticket_id": tid,
+                "ticket_state": t["state"],
+                "protection": dict(p) if p else None,
+                "volumes": volumes,
+                "missing_volumes": missing,
+                "can_rebuild_single": (p is not None and p["state"] == "protected"
+                                       and parity_path.exists() and len(missing) <= 1),
+                "disk": {
+                    "protection_plus_temp_bytes": self._protection_body_bytes(tid),
+                    "cap_bytes": PROTECTED_DISK_BUDGET_VOLUMES * v if v else 0,
+                    "cap_volumes": PROTECTED_DISK_BUDGET_VOLUMES,
+                    "rebuild_read_budget_bytes":
+                        REBUILD_READ_BUDGET_VOLUMES * v if v else 0,
+                    "body_buffer_cap_bytes": 1024 * 1024,
+                    "chunk_size": prot.CHUNK_SIZE,
+                },
+            }
+            last = getattr(self, "_last_rebuild_io", None)
+            if last and last["ticket_id"] == tid:
+                out["last_rebuild_io"] = last
+            return out
+
     # ---------------- 辅助 ----------------
     def _set_blocked(self, tid: str, reason: str | None) -> None:
         self.db.execute("UPDATE tickets SET blocked_reason=? WHERE id=?", (reason, tid))
@@ -369,5 +659,5 @@ class Engine:
             self.sim.reset()
             shutil.rmtree(self.retained_root, ignore_errors=True)
             self.retained_root.mkdir(parents=True, exist_ok=True)
-            for table in ("ops", "pvcs", "tickets"):
+            for table in ("ops", "pvcs", "protection", "tickets"):
                 self.db.execute(f"DELETE FROM {table}")
